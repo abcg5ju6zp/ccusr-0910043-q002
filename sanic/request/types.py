@@ -55,6 +55,7 @@ from sanic.headers import (
 from sanic.http import Stage
 from sanic.log import error_logger
 from sanic.models.protocol_types import TransportProtocol
+from sanic.proxy import ProxyDecision, ProxyTrustPolicy, adjudicate
 from sanic.response import BaseHTTPResponse, HTTPResponse
 
 from .form import parse_multipart_form
@@ -98,6 +99,8 @@ class Request(Generic[sanic_type, ctx_type]):
         "_parsed_url",
         "_port",
         "_protocol",
+        "_proxy_decision",
+        "_proxy_policy",
         "_remote_addr",
         "_request_middleware_started",
         "_response_middleware_started",
@@ -185,6 +188,13 @@ class Request(Generic[sanic_type, ctx_type]):
         self._response_middleware_started = False
         self.responded: bool = False
         self.route: Route | None = None
+        # 受理时捕获当前代理信任策略版本：本次请求全程使用该版本裁决，
+        # 之后的热更新只影响新受理的请求
+        proxy_registry = getattr(app, "proxy_registry", None)
+        self._proxy_policy: ProxyTrustPolicy | None = (
+            proxy_registry.current if proxy_registry is not None else None
+        )
+        self._proxy_decision: ProxyDecision | None = None
         self.stream: Stream | None = None
         self._match_info: dict[str, Any] = {}
         self._protocol: BaseProtocol | None = None
@@ -608,6 +618,26 @@ class Request(Generic[sanic_type, ctx_type]):
     def client_ip(self) -> str:
         """项目内部接口说明。"""
         return self.remote_addr or self.ip
+
+    @property
+    def proxy_decision(self) -> ProxyDecision:
+        """本次请求的代理链裁决结论。
+
+        使用受理时捕获的策略版本进行裁决，结果在请求生命周期内
+        缓存不变；原始代理链保留在 ``decision.chain`` 中，
+        唯一的有效来源为 ``decision.effective_source``。
+        """
+        if self._proxy_decision is None:
+            policy = self._proxy_policy or ProxyTrustPolicy()
+            self._proxy_decision = adjudicate(
+                self.headers,
+                self.ip,
+                policy,
+                forwarded_for_header=self.app.config.get(
+                    "FORWARDED_FOR_HEADER", "X-Forwarded-For"
+                ),
+            )
+        return self._proxy_decision
 
     @property
     def scheme(self) -> str:

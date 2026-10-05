@@ -79,6 +79,7 @@ from sanic.models.futures import (
 )
 from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
+from sanic.proxy import ProxyTrustRegistry
 from sanic.request import Request
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
@@ -155,6 +156,7 @@ class Sanic(
         "multiplexer",
         "named_request_middleware",
         "named_response_middleware",
+        "proxy_registry",
         "repl_ctx",
         "request_class",
         "request_middleware",
@@ -323,6 +325,9 @@ class Sanic(
         self.request_class = request_class or Request
         self.request_middleware: deque[Middleware] = deque()
         self.response_middleware: deque[Middleware] = deque()
+        self.proxy_registry: ProxyTrustRegistry = (
+            ProxyTrustRegistry.from_config(self.config)
+        )
         self.router: Router = router or Router()
         self.shared_ctx: SharedContext = SharedContext()
         self.signal_router: SignalRouter = signal_router or SignalRouter()
