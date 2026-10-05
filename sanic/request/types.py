@@ -55,6 +55,12 @@ from sanic.headers import (
 from sanic.http import Stage
 from sanic.log import error_logger
 from sanic.models.protocol_types import TransportProtocol
+from sanic.proxy.judge import ProxyJudge
+from sanic.proxy.types import (
+    ProxyDecision,
+    ProxyDecisionAction,
+    ProxyVerdict,
+)
 from sanic.response import BaseHTTPResponse, HTTPResponse
 
 from .form import parse_multipart_form
@@ -122,6 +128,7 @@ class Request(Generic[sanic_type, ctx_type]):
         "parsed_json",
         "parsed_not_grouped_args",
         "parsed_token",
+        "proxy_decision",
         "raw_url",
         "responded",
         "route",
@@ -181,6 +188,7 @@ class Request(Generic[sanic_type, ctx_type]):
             tuple[bool, bool, str, str], list[tuple[str, str]]
         ] = defaultdict(list)
         self.parsed_token: str | None = None
+        self.proxy_decision: ProxyDecision | None = None
         self._request_middleware_started = False
         self._response_middleware_started = False
         self.responded: bool = False
@@ -586,28 +594,147 @@ class Request(Generic[sanic_type, ctx_type]):
 
     # Proxy properties (using SERVER_NAME/forwarded/request/transport info)
 
+    def _adjudicate(self) -> ProxyDecision | None:
+        """受理时绑定策略版本并裁决代理链；结果在请求生命周期内复用。
+
+        未登记任何代理链策略时返回 None，由调用方沿用旧版转发处理。
+        一旦登记了策略但加载或裁决失败，返回失败闭合结论：忽略全部
+        转发声明、回退到直连对端，绝不退回可能采信伪造头的旧路径。
+        """
+        if self.proxy_decision is not None:
+            return self.proxy_decision
+        registry = getattr(self.app, "proxy_policies", None)
+        if registry is None:
+            return None
+        policy = None
+        try:
+            ensure = getattr(self.app, "_ensure_proxy_policy", None)
+            policy = ensure() if ensure is not None else registry.snapshot()
+        except Exception:
+            error_logger.exception(
+                "Failed to load proxy chain policy; failing closed and "
+                "ignoring forwarding headers for this request"
+            )
+            self.proxy_decision = self._fail_closed_decision(0)
+            return self.proxy_decision
+        if policy is None:
+            return None
+        try:
+            judge = ProxyJudge(policy)
+            self.proxy_decision = judge.adjudicate(
+                self.headers,
+                self.ip or None,
+                xff_header=self.app.config.FORWARDED_FOR_HEADER.lower(),
+            )
+        except Exception:
+            error_logger.exception(
+                "Proxy chain adjudication failed; failing closed and "
+                "ignoring forwarding headers for this request"
+            )
+            self.proxy_decision = self._fail_closed_decision(policy.version)
+        return self.proxy_decision
+
+    def _fail_closed_decision(self, version: int) -> ProxyDecision:
+        """策略已启用但无法裁决时的失败闭合结论。"""
+        peer = self.ip or None
+        return ProxyDecision(
+            verdict=ProxyVerdict.UNRESOLVED,
+            action=ProxyDecisionAction.REJECT,
+            effective_client=peer,
+            peer=peer,
+            policy_version=version,
+            reasons=("proxy chain could not be resolved; fail closed",),
+        )
+
+    @property
+    def proxy_verdict(self) -> ProxyDecision | None:
+        """本次请求的代理链裁决结论（可解释对象）；未启用策略时为 None。"""
+        return self._adjudicate()
+
+    @staticmethod
+    def _options_from_decision(decision: ProxyDecision) -> Options:
+        """裁决结论到旧版 ``forwarded`` 映射的适配；被拒结论不泄露声明。"""
+        if decision.action == ProxyDecisionAction.REJECT:
+            return {}
+        options: Options = {}
+        if decision.effective_client:
+            options["for"] = decision.effective_client
+        if decision.proto:
+            options["proto"] = decision.proto
+        if decision.host:
+            options["host"] = decision.host
+        if decision.port:
+            options["port"] = decision.port
+        if decision.path:
+            options["path"] = decision.path
+        return options
+
     @property
     def forwarded(self) -> Options:
         """项目内部接口说明。"""
         if self.parsed_forwarded is None:
-            self.parsed_forwarded = (
-                parse_forwarded(self.headers, self.app.config)
-                or parse_xforwarded(self.headers, self.app.config)
-                or {}
-            )
+            decision = self._adjudicate()
+            if decision is not None:
+                self.parsed_forwarded = self._options_from_decision(decision)
+            else:
+                self.parsed_forwarded = (
+                    parse_forwarded(self.headers, self.app.config)
+                    or parse_xforwarded(self.headers, self.app.config)
+                    or {}
+                )
         return self.parsed_forwarded
 
     @property
     def remote_addr(self) -> str:
         """项目内部接口说明。"""
         if not hasattr(self, "_remote_addr"):
-            self._remote_addr = str(self.forwarded.get("for", ""))
+            decision = self._adjudicate()
+            if decision is not None:
+                if decision.action == ProxyDecisionAction.REJECT:
+                    self._remote_addr = ""
+                else:
+                    self._remote_addr = decision.effective_client or ""
+            else:
+                self._remote_addr = str(self.forwarded.get("for", ""))
         return self._remote_addr
 
     @property
     def client_ip(self) -> str:
         """项目内部接口说明。"""
         return self.remote_addr or self.ip
+
+    @property
+    def proxy_log_label(self) -> tuple[str, dict[str, str]] | None:
+        """供访问日志使用的授权地址标签与附加上下文。
+
+        返回 ``(host 字段, 额外字段)``；未启用代理链策略时返回 None，
+        由日志调用方沿用 ``ip:port`` 的旧格式。地址信息的暴露受
+        ``PROXY_LOG_ADDRESSES`` / 策略 ``log_full_chain`` 控制。
+        """
+        decision = self._adjudicate()
+        if decision is None:
+            return None
+        show_addresses = bool(self.app.config.get("PROXY_LOG_ADDRESSES", True))
+        extra = {"proxy_verdict": decision.verdict.value}
+        if not show_addresses:
+            return "redacted", extra
+        label = decision.effective_client or decision.peer or "-"
+        # 完整原始链含未经担保的声明，必须同时由策略版本与全局开关授权
+        full_chain = bool(
+            decision.log_full_chain
+            and self.app.config.get("PROXY_LOG_FULL_CHAIN", False)
+        )
+        if full_chain:
+            extra["proxy_chain"] = (
+                " -> ".join(
+                    hop.forwarded_for or "?" for hop in decision.original_chain
+                )
+                or "-"
+            )
+        else:
+            # 只暴露经担保的链段，未通过担保的左侧声明不进日志
+            extra["proxy_hops"] = str(len(decision.validated_chain))
+        return label, extra
 
     @property
     def scheme(self) -> str:

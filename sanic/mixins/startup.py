@@ -425,6 +425,11 @@ class StartupMixin(metaclass=SanicMeta):
                 "#proxy-configuration"
             )
 
+        proxy_chain = self.config.get("PROXY_CHAIN")
+        if proxy_chain:
+            # 尽早暴露配置错误，并发布首个策略版本
+            cast("Sanic", self)._ensure_proxy_policy()
+
         if not self.state.is_debug:
             self.state.mode = Mode.DEBUG if debug else Mode.PRODUCTION
 

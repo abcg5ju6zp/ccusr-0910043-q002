@@ -168,7 +168,10 @@ class WebSocketProtocol(HttpProtocol):
         await self.websocket.connection_made(self, loop=loop)
         self.websocket_url = self._http.request.url
         self.websocket_peer = f"{id(self):X}"[-5:-1] + "unx"
-        if ip := self._http.request.client_ip:
+        labeled = self._http.request.proxy_log_label
+        if labeled is not None:
+            self.websocket_peer = labeled[0]
+        elif ip := self._http.request.client_ip:
             self.websocket_peer = f"{ip}:{self._http.request.port}"
         self.log_websocket("OPEN")
         return self.websocket

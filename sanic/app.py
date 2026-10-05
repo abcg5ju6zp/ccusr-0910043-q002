@@ -79,6 +79,11 @@ from sanic.models.futures import (
 )
 from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
+from sanic.proxy.policy import (
+    PROXY_POLICY_RELOADED,
+    ProxyPolicy,
+    ProxyPolicyRegistry,
+)
 from sanic.request import Request
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
@@ -139,6 +144,7 @@ class Sanic(
         "_future_statics",
         "_inspector",
         "_manager",
+        "_proxy_config_loaded",
         "_state",
         "_task_registry",
         "_test_client",
@@ -155,6 +161,7 @@ class Sanic(
         "multiplexer",
         "named_request_middleware",
         "named_response_middleware",
+        "proxy_policies",
         "repl_ctx",
         "request_class",
         "request_middleware",
@@ -306,6 +313,11 @@ class Sanic(
         self._task_registry: dict[str, Task | None] = {}
         self._test_client: Any = None
         self._test_manager: Any = None
+        # 代理链裁决策略注册中心；默认无策略（沿用旧版转发处理）
+        self.proxy_policies: ProxyPolicyRegistry = ProxyPolicyRegistry(
+            on_reload=self._proxy_policy_reloaded
+        )
+        self._proxy_config_loaded = False
         self.asgi = False
         self.auto_reload = False
         self.blueprints: dict[str, Blueprint] = {}
@@ -354,6 +366,56 @@ class Sanic(
             return get_running_loop()
         except RuntimeError:  # no cov
             return asyncio.get_event_loop_policy().get_event_loop()
+
+    # ------------------------------------------------------------------ #
+    # Proxy chain policy
+    # ------------------------------------------------------------------ #
+
+    def configure_proxy_chain(self, config: dict[str, Any]) -> ProxyPolicy:
+        """登记可信跳点、授权头部族与迁移期限并发布策略版本。
+
+        详见 :func:`sanic.proxy.policy.policy_from_mapping` 的配置结构。
+        """
+        return self.proxy_policies.load_dict(config)
+
+    def reload_proxy_policy(
+        self,
+        source: Any,
+    ) -> ProxyPolicy:
+        """热更新代理链策略；源失败时保留当前版本。"""
+        return self.proxy_policies.reload(source)
+
+    def _ensure_proxy_policy(self):
+        """首次受理时按 ``config.PROXY_CHAIN`` 惰性装配策略版本。
+
+        每个工作进程独立装配一次；请求随后通过注册中心快照绑定版本。
+        """
+        if getattr(self, "_proxy_config_loaded", False):
+            return self.proxy_policies.snapshot()
+        self._proxy_config_loaded = True
+        data = self.config.get("PROXY_CHAIN")
+        if data:
+            self.proxy_policies.load_dict(data)
+        return self.proxy_policies.snapshot()
+
+    def _proxy_policy_reloaded(self, policy: ProxyPolicy) -> None:
+        """策略发布后的回调：尽力派发热更新信号（不阻塞发布）。"""
+        try:
+            loop = get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            coro = self.dispatch(
+                PROXY_POLICY_RELOADED,
+                context={"version": policy.version},
+                fail_not_found=False,
+                inline=True,
+            )
+            loop.create_task(coro)
+        except Exception:  # noqa: BLE001 - 信号失败不影响策略切换
+            error_logger.exception(
+                "Failed to dispatch %s", PROXY_POLICY_RELOADED
+            )
 
     # -------------------------------------------------------------------- #
     # Registration

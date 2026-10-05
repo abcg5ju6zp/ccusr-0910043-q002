@@ -471,7 +471,11 @@ class Http(Stream, metaclass=TouchUpMeta):
                 else ""
             ),
         }
-        if ip := req.client_ip:
+        if labeled := req.proxy_log_label:
+            host, proxy_extra = labeled
+            extra["host"] = host
+            extra.update(proxy_extra)
+        elif ip := req.client_ip:
             extra["host"] = f"{ip}:{req.port}"
         extra["request"] = f"{req.method} {req.url}"
         access_logger.info("", extra=extra)
